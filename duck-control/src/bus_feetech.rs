@@ -17,9 +17,8 @@
 //! - **The sign of a joint is not a given.** On the XL330 robot the horn orientation fixes the
 //!   positive direction and it matches the model. With different servos in remodelled parts
 //!   that has to be measured per joint, so it is a parameter: [`FeetechConfig::directions`].
-//! - **There is no IMU on this bus.** The `imu_to_dxl` board speaks Dynamixel Protocol 2; until
-//!   a Feetech-speaking IMU source exists this backend reports the default orientation and
-//!   says, through [`RobotIo::imu_ready`], that it is not a measurement.
+//! - **The IMU speaks Protocol 2.** Read ID 200 separately before the Feetech servo read;
+//!   both protocols use the same serial handle and never overlap transactions.
 //!
 //! Register addresses and semantics are from Feetech's *磁编码 STS 内存表* v1.1 (2026-08-27) and
 //! *SCS 通信协议* v1.0 (2026-06-09); `rustypot`'s `sts3215` table agrees with them.
@@ -27,12 +26,15 @@
 use std::f64::consts::PI;
 use std::time::Duration;
 
-use rustypot::servo::feetech::sts3215::Sts3215Controller;
+use rustypot::DynamixelProtocolHandler;
+use rustypot::servo::feetech::sts3215;
+use serialport::SerialPort;
 
-use crate::imu::ImuData;
-use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+use crate::bus::{STALE_RUN_WARN, StaleImuTracker};
+use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
+use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
-    BAUD_RATE, FACTORY_ID, FEETECH_EXPECTED_MODE, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
+    BAUD_RATE, FACTORY_ID, FEETECH_EXPECTED_MODE, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
 };
 
 /// What `rustypot` returns. Its own alias is private, so it is spelled out here.
@@ -138,7 +140,13 @@ impl FeetechConfig {
 }
 
 pub struct FeetechIo {
-    controller: Sts3215Controller,
+    // 两种协议借用同一串口，事务必须串行完成，不能并发收发。
+    serial: Box<dyn SerialPort>,
+    protocol: DynamixelProtocolHandler,
+    imu_protocol: DynamixelProtocolHandler,
+    imu: SflpDecoder,
+    stale_imu: StaleImuTracker,
+    imu_read_ok: bool,
     config: FeetechConfig,
     /// Encoder steps per second for one count of a speed register — 1 or 50, from `phase`.
     /// Read at [`Self::check_registers`]; 1 until then, which is what the servos ship with.
@@ -150,7 +158,12 @@ pub struct FeetechIo {
 impl FeetechIo {
     pub fn open(port: &str, config: FeetechConfig) -> Result<Self> {
         Ok(Self {
-            controller: open_controller(port, BAUD_RATE)?,
+            serial: open_serial(port, BAUD_RATE)?,
+            protocol: DynamixelProtocolHandler::v1(),
+            imu_protocol: DynamixelProtocolHandler::v2(),
+            imu: SflpDecoder::default(),
+            stale_imu: StaleImuTracker::default(),
+            imu_read_ok: false,
             config,
             speed_steps_per_count: 1.0,
             last_slow: None,
@@ -182,8 +195,8 @@ impl FeetechIo {
 
     fn check_registers_of(&mut self, id: u8) -> Result<usize> {
         let version = self
-            .controller
-            .read_raw_data(id, VERSION_ADDR, VERSION_LEN)
+            .protocol
+            .read(self.serial.as_mut(), id, VERSION_ADDR, VERSION_LEN)
             .map_err(|e| IoError::Bus(format!("read version block on {id}: {e}")))?;
         if version.len() != VERSION_LEN as usize {
             return Err(IoError::ShortRead {
@@ -202,8 +215,8 @@ impl FeetechIo {
             )));
         }
 
-        let level = first(
-            self.controller.read_response_status_level(id),
+        let level = read_register(
+            sts3215::read_response_status_level(&self.protocol, self.serial.as_mut(), id),
             "response_status_level",
             id,
         )?;
@@ -214,7 +227,11 @@ impl FeetechIo {
             )));
         }
 
-        let mode = first(self.controller.read_mode(id), "mode", id)?;
+        let mode = read_register(
+            sts3215::read_mode(&self.protocol, self.serial.as_mut(), id),
+            "mode",
+            id,
+        )?;
         if mode != FEETECH_EXPECTED_MODE {
             tracing::warn!(
                 id,
@@ -226,7 +243,11 @@ impl FeetechIo {
         }
 
         let mut fixed = 0;
-        let baud = first(self.controller.read_baudrate(id), "baudrate", id)?;
+        let baud = read_register(
+            sts3215::read_baudrate(&self.protocol, self.serial.as_mut(), id),
+            "baudrate",
+            id,
+        )?;
         if baud != 0 {
             tracing::warn!(
                 id,
@@ -234,7 +255,9 @@ impl FeetechIo {
                 want = 0,
                 "correcting motor baud rate register"
             );
-            self.with_eeprom_unlocked(id, |c| c.write_baudrate(id, 0))?;
+            self.with_eeprom_unlocked(id, |protocol, serial| {
+                sts3215::write_baudrate(protocol, serial, id, 0)
+            })?;
             fixed += 1;
         }
         Ok(fixed)
@@ -243,7 +266,11 @@ impl FeetechIo {
     /// `phase` bit 2 decides whether a speed count is one step per second or fifty.
     fn read_speed_unit(&mut self) -> Result<()> {
         let id = JOINT_IDS[0];
-        let phase = first(self.controller.read_phase(id), "phase", id)?;
+        let phase = read_register(
+            sts3215::read_phase(&self.protocol, self.serial.as_mut(), id),
+            "phase",
+            id,
+        )?;
         self.speed_steps_per_count = if phase & PHASE_SPEED_UNIT_FINE != 0 {
             1.0
         } else {
@@ -261,14 +288,13 @@ impl FeetechIo {
     fn with_eeprom_unlocked(
         &mut self,
         id: u8,
-        write: impl FnOnce(&mut Sts3215Controller) -> RpResult<()>,
+        write: impl FnOnce(&DynamixelProtocolHandler, &mut dyn SerialPort) -> RpResult<()>,
     ) -> Result<()> {
-        self.controller
-            .write_lock(id, false)
+        sts3215::write_lock(&self.protocol, self.serial.as_mut(), id, false)
             .map_err(|e| IoError::Bus(format!("unlock eeprom on {id}: {e}")))?;
-        let result = write(&mut self.controller);
+        let result = write(&self.protocol, self.serial.as_mut());
         std::thread::sleep(EEPROM_SETTLE);
-        let relock = self.controller.write_lock(id, true);
+        let relock = sts3215::write_lock(&self.protocol, self.serial.as_mut(), id, true);
         result.map_err(|e| IoError::Bus(format!("eeprom write on {id}: {e}")))?;
         relock.map_err(|e| IoError::Bus(format!("relock eeprom on {id}: {e}")))
     }
@@ -278,8 +304,8 @@ impl FeetechIo {
         let mut missing = Vec::new();
         for &id in &JOINT_IDS {
             let answered = self
-                .controller
-                .ping(id)
+                .protocol
+                .ping(self.serial.as_mut(), id)
                 .map_err(|e| IoError::Bus(format!("ping {id}: {e}")))?;
             if !answered {
                 missing.push(id);
@@ -305,8 +331,10 @@ impl FeetechIo {
             .ok_or_else(|| IoError::Bus(format!("{id} is not a joint id")))?;
 
         let fresh = self
-            .controller
-            .ping(FACTORY_ID)
+
+            .protocol
+
+            .ping(self.serial.as_mut(), FACTORY_ID)
             .map_err(|e| IoError::Bus(format!("ping factory id {FACTORY_ID}: {e}")))?;
         if !fresh {
             return Ok(false);
@@ -319,15 +347,12 @@ impl FeetechIo {
 
         // The lock is per servo and the servo changes address half way through: open it under
         // the old ID, close it under the new one.
-        self.controller
-            .write_lock(FACTORY_ID, false)
+        sts3215::write_lock(&self.protocol, self.serial.as_mut(), FACTORY_ID, false)
             .map_err(|e| IoError::Bus(format!("unlock eeprom on {FACTORY_ID}: {e}")))?;
-        self.controller
-            .write_id(FACTORY_ID, id)
+        sts3215::write_id(&self.protocol, self.serial.as_mut(), FACTORY_ID, id)
             .map_err(|e| IoError::Bus(format!("write id {id} on {FACTORY_ID}: {e}")))?;
         std::thread::sleep(EEPROM_SETTLE);
-        self.controller
-            .write_lock(id, true)
+        sts3215::write_lock(&self.protocol, self.serial.as_mut(), id, true)
             .map_err(|e| IoError::Bus(format!("relock eeprom on {id}: {e}")))?;
 
         let fixed = self.check_registers_of(id)?;
@@ -335,8 +360,8 @@ impl FeetechIo {
         RobotIo::reboot(self, id)?;
         std::thread::sleep(REBOOT_SETTLE);
         let back = self
-            .controller
-            .ping(id)
+            .protocol
+            .ping(self.serial.as_mut(), id)
             .map_err(|e| IoError::Bus(format!("ping {id} after reboot: {e}")))?;
         if !back {
             return Err(IoError::Bus(format!(
@@ -344,7 +369,11 @@ impl FeetechIo {
                  the id did not reach eeprom, or the firmware has no REBOOT instruction"
             )));
         }
-        let status = first(self.controller.read_status(id), "status", id)?;
+        let status = read_register(
+            sts3215::read_status(&self.protocol, self.serial.as_mut(), id),
+            "status",
+            id,
+        )?;
         if status != 0 {
             tracing::error!(
                 id,
@@ -365,8 +394,8 @@ impl FeetechIo {
     /// Present positions only, in model radians.
     pub fn present_positions(&mut self) -> Result<[f64; NUM_JOINTS]> {
         let blocks = self
-            .controller
-            .sync_read_raw_data(&JOINT_IDS, READ_ADDR, 2)
+            .protocol
+            .sync_read(self.serial.as_mut(), &JOINT_IDS, READ_ADDR, 2)
             .map_err(|e| IoError::Bus(format!("read present positions: {e}")))?;
         if blocks.len() != NUM_JOINTS {
             return Err(IoError::ShortRead {
@@ -395,7 +424,7 @@ impl FeetechIo {
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
         let mut failed = Vec::new();
         for &id in &JOINT_IDS {
-            if let Err(e) = self.controller.write_torque_enable(id, on) {
+            if let Err(e) = sts3215::write_torque_enable(&self.protocol, self.serial.as_mut(), id, on) {
                 failed.push(format!("torque {on} on {id}: {e}"));
             }
         }
@@ -430,8 +459,8 @@ impl FeetechIo {
     }
 }
 
-/// The serial port at `baud`, wrapped in a Feetech-protocol controller.
-fn open_controller(port: &str, baud: u32) -> Result<Sts3215Controller> {
+/// Open the one port shared by the Feetech servos and Protocol 2 IMU.
+fn open_serial(port: &str, baud: u32) -> Result<Box<dyn SerialPort>> {
     let serial = serialport::new(port, baud)
         .timeout(READ_TIMEOUT)
         .open()
@@ -439,22 +468,12 @@ fn open_controller(port: &str, baud: u32) -> Result<Sts3215Controller> {
             path: port.to_owned(),
             source: std::io::Error::other(e),
         })?;
-    Ok(Sts3215Controller::new()
-        .with_protocol_v1()
-        .with_serial_port(serial))
+    Ok(serial)
 }
 
-/// rustypot returns a `Vec` even for a single-id read; an empty one means the servo did not
-/// answer, which must not be read as "register is fine".
-fn first<T: Copy>(read: RpResult<Vec<T>>, name: &'static str, id: u8) -> Result<T> {
-    read.map_err(|e| IoError::Bus(format!("read {name} on {id}: {e}")))?
-        .first()
-        .copied()
-        .ok_or(IoError::ShortRead {
-            what: "register read",
-            expected: 1,
-            got: 0,
-        })
+/// Attach register context to the low-level rustypot error.
+fn read_register<T>(read: RpResult<T>, name: &'static str, id: u8) -> Result<T> {
+    read.map_err(|e| IoError::Bus(format!("read {name} on {id}: {e}")))
 }
 
 /// Sign-magnitude, bit 15 the sign: how the STS reports position, speed and current.
@@ -517,9 +536,33 @@ fn decode_block(block: &[u8], direction: f64, speed_steps_per_count: f64) -> Fee
 
 impl RobotIo for FeetechIo {
     fn read(&mut self) -> Result<Sensors> {
+        self.imu_read_ok = false;
+        // 先单播读取 DXL IMU，完整应答结束后再发送飞特 Sync Read。
+        let raw = self
+            .imu_protocol
+            .read(self.serial.as_mut(), IMU_DXL_ID, 124, IMU_BLOCK_LEN as u8)
+            .map_err(|e| IoError::Bus(format!("DXL IMU {IMU_DXL_ID} read: {e}")))?;
+        let raw: [u8; IMU_BLOCK_LEN] = raw.as_slice().try_into().map_err(|_| IoError::ShortRead {
+            what: "imu block",
+            expected: IMU_BLOCK_LEN,
+            got: raw.len(),
+        })?;
+        let run = self.stale_imu.observe(&raw);
+        if run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)) {
+            tracing::warn!(
+                consecutive = run,
+                total = self.stale_imu.stale.total,
+                "imu board has returned the same sample {run} reads running — orientation is frozen"
+            );
+        }
+        // 板子重启或 SFLP 尚未就绪时，重新积累有效姿态样本。
+        if raw[6..] == [0; 6] {
+            self.imu = SflpDecoder::default();
+        }
+        let imu = self.imu.decode(&raw);
         let blocks = self
-            .controller
-            .sync_read_raw_data(&JOINT_IDS, READ_ADDR, READ_LEN)
+            .protocol
+            .sync_read(self.serial.as_mut(), &JOINT_IDS, READ_ADDR, READ_LEN)
             .map_err(|e| IoError::Bus(format!("motor sync_read: {e}")))?;
         if blocks.len() != NUM_JOINTS {
             return Err(IoError::ShortRead {
@@ -530,7 +573,7 @@ impl RobotIo for FeetechIo {
         }
 
         let mut sensors = Sensors {
-            imu: ImuData::default(),
+            imu,
             ..Sensors::default()
         };
         let mut temps_c = [0.0; NUM_JOINTS];
@@ -564,6 +607,7 @@ impl RobotIo for FeetechIo {
                 temps_c,
             });
         }
+        self.imu_read_ok = true;
         Ok(sensors)
     }
 
@@ -574,8 +618,9 @@ impl RobotIo for FeetechIo {
             .zip(&self.config.directions)
             .map(|(&rad, &dir)| rad_to_raw(rad, dir).to_le_bytes().to_vec())
             .collect();
-        self.controller
-            .sync_write_raw_data(&JOINT_IDS, GOAL_POSITION_ADDR, &data)
+        self
+            .protocol
+            .sync_write(self.serial.as_mut(), &JOINT_IDS, GOAL_POSITION_ADDR, &data)
             .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
     }
 
@@ -586,14 +631,15 @@ impl RobotIo for FeetechIo {
     fn reboot(&mut self, id: u8) -> Result<()> {
         // The protocol document asks for torque off before a REBOOT. Best effort: the servo
         // being rebooted is, by definition, one that may not be answering properly.
-        if let Err(e) = self.controller.write_torque_enable(id, false) {
+        if let Err(e) = sts3215::write_torque_enable(&self.protocol, self.serial.as_mut(), id, false) {
             tracing::warn!(id, error = %e, "could not switch torque off before the reboot");
         }
         // The servo sends no status packet for 0x08; rustypot reports that as `Ok(false)`, so
         // only a failure to send is an error. No waiting here — `Safety::reboot_motors` calls
         // this once per servo from inside the control tick.
-        self.controller
-            .reboot(id)
+        self
+            .protocol
+            .reboot(self.serial.as_mut(), id)
             .map(|_| ())
             .map_err(|e| IoError::Bus(format!("reboot {id}: {e}")))
     }
@@ -606,8 +652,7 @@ impl RobotIo for FeetechIo {
         // 320:1 gearbox not to ring.
         let p = scale_gain(kp, self.config.p_scale);
         for &id in &JOINT_IDS {
-            self.controller
-                .write_p_coefficient(id, p)
+            sts3215::write_p_coefficient(&self.protocol, self.serial.as_mut(), id, p)
                 .map_err(|e| IoError::Bus(format!("p_coefficient {p} (kp {kp}) on {id}: {e}")))?;
         }
         Ok(())
@@ -628,10 +673,12 @@ impl RobotIo for FeetechIo {
         })
     }
 
-    /// No IMU on this bus yet: the orientation in [`Sensors`] is the upright default, and this
-    /// is what tells the rest of the daemon not to treat it as a measurement.
+    fn imu_stale(&self) -> ImuStale {
+        self.stale_imu.stale
+    }
+
     fn imu_ready(&self) -> bool {
-        false
+        self.imu_read_ok && self.imu.ready() && self.stale_imu.stale.run < STALE_RUN_WARN
     }
 }
 

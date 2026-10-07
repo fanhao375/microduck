@@ -33,6 +33,39 @@ The policies it runs are trained next door, in
 **[microduck_rl](https://github.com/pollen-robotics/microduck_rl)** — MuJoCo and PPO, the sim2real
 recipe, and the export to ONNX that this repo loads.
 
+## 飞特 HD1910 + DXL IMU（feetech_imu 分支）
+
+本分支基于 feetech，用于同一条 TTL 半双工总线上的 HD1910 舵机与
+imu_to_dxl IMU 板。IMU 使用 **DYNAMIXEL Protocol 2.0、ID 200、地址 124、
+12 字节**；舵机继续使用飞特 STS/SMS 协议。两者均为 **1 Mbps、8N1**。
+IMU 可使用 DXL 固件或支持 DXL 的自适应固件，不可使用仅支持飞特的固件。
+
+在现有 robotd.toml 的 [bus] 段中设置以下字段，不要重复创建该段：
+
+~~~toml
+[bus]
+port = "/dev/ttyS2"
+protocol = "feetech-sts"
+~~~
+
+保留并按实际装配校准 [bus.feetech] 的 p_scale、directions。
+IMU ID 200 必须唯一；IMU 安装方向默认沿用原 MicroDuck 的传感器到机身旋转，
+装配方向不同需同步调整解码器。一个串口只能由一个主机进程占用。
+
+每轮先完成 DXL IMU 单播读取，再完成飞特舵机同步读取，最后按原控制流程下发
+舵机目标。两种协议共用一个串口句柄，不混入同一条 Sync Read，也不并发读取。
+IMU 接入与失效处理详见 [总线设计](docs/design/robotd-design.md#feetech-dxl-imu)。
+
+使用 Rust 1.89+ 的 Linux/macOS 开发环境，编译命令：
+
+~~~bash
+cargo build --locked -p robotd --release
+~~~
+
+交叉编译机器人版本及部署步骤见 [开发部署说明](docs/robot/dev-push.md)。
+启动前确认 IMU 已烧录对应固件并与舵机、主机共地；首次联调先在不使能行走策略的
+情况下检查 robotctl monitor 的 IMU 就绪、姿态变化、数据停滞与总线错误。
+代码接入不代表 HD1910 混合协议总线时序或实机行走已验证。
 ## It does things
 
 <table>

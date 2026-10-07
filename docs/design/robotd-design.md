@@ -357,6 +357,30 @@ points that open a real port are gated, so a Mac build still refuses to pretend 
 robot: `robotd --fake` is the laptop path, and it must be asked for explicitly rather than
 fallen back to.
 
+<a id="feetech-dxl-imu"></a>
+
+#### Feetech servos with a DXL IMU
+
+With [bus] protocol = "feetech-sts", FeetechIo owns one serial handle at
+1 Mbps. Each sensor cycle first performs a Protocol 2 unicast Read of IMU ID 200,
+address 124, length 12; only after that response completes does it issue the
+Feetech Sync Read of JOINT_IDS at 56/15. The IMU is not added to the Feetech
+servo list. Servo configuration, replacement and writes still use Protocol 1
+framing through rustypot's low-level STS functions on that same handle.
+
+The 12-byte IMU block uses the existing SflpDecoder, including its mounting
+rotation and warm-up. Transport errors or wrong lengths fail the sensor cycle
+and clear readiness; an all-zero quaternion restarts decoder warm-up. Repeated
+blocks feed the existing ImuStale counters and warning cadence. Readiness also
+requires the latest complete sensor cycle to have succeeded and fewer than
+25 consecutive repeated blocks. A fresh valid stream restores readiness; no
+default upright pose is advertised as a ready IMU after a read failure.
+
+This requires a DXL-capable IMU firmware, not a Feetech-only IMU. The protocols
+never share a Sync Read packet or execute concurrently. Compared with the
+Dynamixel-only bus there is one additional transaction per tick; each read uses
+the existing 30 ms serial timeout. Mixed-bus timing and the HD1910's handling of
+foreign packets must still be verified on the actual hardware.
 ### 2.2 One observation builder
 
 Every alpha policy is `obs[1,61] → actions[1,14]` — verified across walking, standing, ground
@@ -957,7 +981,7 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 |---|---|
 | `duck-control` as a workspace crate | boundary enforced by the compiler, no second repo |
 | bus layer written fresh, constants borrowed | thin code, but the tuned numbers are not re-derived |
-| the IMU in the motors' `sync_read` | it is a device on the same bus; no IMU abstraction |
+| the IMU on the motor bus | DXL uses a combined read; Feetech uses a separate DXL IMU read on the same handle |
 | Rust consts for the model | one robot exists |
 | params file, not watched | establishes the file and its location; the watcher is later |
 | policy path in params, default = release dir | updates carry the policy; devs override it |

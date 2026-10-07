@@ -111,7 +111,7 @@ pub struct ImuStale {
 }
 
 pub trait RobotIo {
-    /// One transaction: joints and IMU together.
+    /// One sensor cycle: joints and IMU, with separate transactions on a mixed-protocol bus.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
